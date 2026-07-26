@@ -1,6 +1,7 @@
 package com.chamith.eventbook.service;
 
 import com.chamith.eventbook.concurrency.SeatLockRegistry;
+import com.chamith.eventbook.concurrency.SeatLockTimeoutException;
 import com.chamith.eventbook.domain.Booking;
 import com.chamith.eventbook.domain.Seat;
 import com.chamith.eventbook.domain.SeatStatus;
@@ -17,6 +18,8 @@ import org.springframework.transaction.annotation.Transactional;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.NoSuchElementException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Deliberately naive: read-then-write with no locking of any kind.
@@ -38,18 +41,18 @@ public class BookingService {
         this.seatLockRegistry = seatLockRegistry;
     }
 
+    private static final long LOCK_WAIT_MILLIS = 500;
+
     /**
-     * synchronized on a per-seat lock object: only one thread in this JVM
-     * can be inside the block for a given seatId at a time, so the second
-     * thread's status check can no longer run concurrently with the first
-     * thread's write.
+     * ReentrantLock per seat instead of synchronized: tryLock(timeout) lets
+     * us fail fast with a clear "try again" response instead of queueing
+     * every contending request indefinitely behind whoever got there first.
      *
-     * Caveat to notice when testing: this block ends (and the lock is
-     * released) when the method returns, but @Transactional's commit
-     * happens in the proxy AFTER the method returns — so there's a small
-     * window between "lock released" and "write actually committed" where
-     * @Version is still doing real work as a safety net, not just standing
-     * by unused.
+     * Caveat to notice when testing: the lock is released when the method
+     * returns, but @Transactional's commit happens in the proxy AFTER the
+     * method returns — so there's a small window between "lock released"
+     * and "write actually committed" where @Version is still doing real
+     * work as a safety net, not just standing by unused.
      */
     @Retryable(
             retryFor = ObjectOptimisticLockingFailureException.class,
@@ -58,8 +61,13 @@ public class BookingService {
     )
     @Transactional
     public Booking bookSeat(CreateBookingRequest request) throws InterruptedException {
-        Object lock = seatLockRegistry.lockFor(request.seatId());
-        synchronized (lock) {
+        ReentrantLock lock = seatLockRegistry.lockFor(request.seatId());
+
+        if (!lock.tryLock(LOCK_WAIT_MILLIS, TimeUnit.MILLISECONDS)) {
+            throw new SeatLockTimeoutException(
+                    "Seat " + request.seatId() + " is busy, try again in a moment");
+        }
+        try {
             Seat seat = seatRepository.findById(request.seatId())
                     .orElseThrow(() -> new NoSuchElementException("Seat not found: " + request.seatId()));
 
@@ -74,6 +82,8 @@ public class BookingService {
 
             Booking booking = new Booking(seat, request.userId());
             return bookingRepository.save(booking);
+        } finally {
+            lock.unlock();
         }
     }
 
