@@ -3,6 +3,7 @@ package com.chamith.eventbook.web;
 import com.chamith.eventbook.domain.Event;
 import com.chamith.eventbook.dto.CreateEventRequest;
 import com.chamith.eventbook.dto.EventResponse;
+import com.chamith.eventbook.dto.SeatAvailabilityResponse;
 import com.chamith.eventbook.dto.SeatResponse;
 import com.chamith.eventbook.service.EventService;
 import jakarta.validation.Valid;
@@ -41,5 +42,16 @@ public class EventController {
     public List<SeatResponse> listSeats(@PathVariable Long id) {
         Event event = eventService.getEvent(id);
         return event.getSeats().stream().map(SeatResponse::from).toList();
+    }
+
+    /**
+     * Same information as /seats, different source: this never touches
+     * Postgres or Redis, it reads straight out of the in-memory,
+     * ReentrantReadWriteLock-guarded availability cache. Compare Hibernate
+     * SQL logs between the two endpoints to see the difference directly.
+     */
+    @GetMapping("/{id}/availability")
+    public List<SeatAvailabilityResponse> getAvailability(@PathVariable Long id) {
+        return eventService.getAvailability(id);
     }
 }

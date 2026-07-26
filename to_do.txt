@@ -1,0 +1,29 @@
+@Transactional
+    public Booking bookSeat(CreateBookingRequest request) throws InterruptedException {
+        ReentrantLock lock = seatLockRegistry.lockFor(request.seatId());
+
+        if (!lock.tryLock(LOCK_WAIT_MILLIS, TimeUnit.MILLISECONDS)) {
+            throw new SeatLockTimeoutException(
+                    "Seat " + request.seatId() + " is busy, try again in a moment");
+        }
+        try {
+            Seat seat = seatRepository.findById(request.seatId())
+                    .orElseThrow(() -> new NoSuchElementException("Seat not found: " + request.seatId()));
+
+            if (seat.getStatus() != SeatStatus.AVAILABLE) {
+                throw new IllegalStateException("Seat " + seat.getSeatNumber() + " is already booked");
+            }
+
+            Thread.sleep(100);
+
+            seat.setStatus(SeatStatus.BOOKED);
+            seatRepository.save(seat);
+
+            Booking booking = new Booking(seat, request.userId());
+            return bookingRepository.save(booking);
+        } finally {
+            lock.unlock();
+        }
+}
+
+- The reentrancy and fairness properties (new ReentrantLock(true)) aren't exercised by this code yet — nothing here re-enters the same lock on one thread, and default ReentrantLock() is unfair (a waiting thread isn't guaranteed FIFO order). Worth knowing they exist, not something to chase down right now.

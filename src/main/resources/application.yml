@@ -25,7 +25,19 @@ spring:
 
 server:
   port: 8080
+  error:
+    include-message: always
+    include-binding-errors: always
 
 logging:
   level:
     com.chamith.eventbook: DEBUG
+    org:
+      springframework:
+        web: debug
+        http:
+          converter:
+            json: debug
+        security:
+          web:
+            firewall: debug

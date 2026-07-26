@@ -1,5 +1,6 @@
 package com.chamith.eventbook.service;
 
+import com.chamith.eventbook.concurrency.EventSeatAvailabilityCache;
 import com.chamith.eventbook.concurrency.SeatLockRegistry;
 import com.chamith.eventbook.concurrency.SeatLockTimeoutException;
 import com.chamith.eventbook.domain.Booking;
@@ -33,12 +34,14 @@ public class BookingService {
     private final SeatRepository seatRepository;
     private final BookingRepository bookingRepository;
     private final SeatLockRegistry seatLockRegistry;
+    private final EventSeatAvailabilityCache availabilityCache;
 
     public BookingService(SeatRepository seatRepository, BookingRepository bookingRepository,
-                           SeatLockRegistry seatLockRegistry) {
+                           SeatLockRegistry seatLockRegistry, EventSeatAvailabilityCache availabilityCache) {
         this.seatRepository = seatRepository;
         this.bookingRepository = bookingRepository;
         this.seatLockRegistry = seatLockRegistry;
+        this.availabilityCache = availabilityCache;
     }
 
     private static final long LOCK_WAIT_MILLIS = 500;
@@ -79,6 +82,7 @@ public class BookingService {
 
             seat.setStatus(SeatStatus.BOOKED);
             seatRepository.save(seat);
+            availabilityCache.updateSeatStatus(seat.getEvent().getId(), seat.getId(), SeatStatus.BOOKED);
 
             Booking booking = new Booking(seat, request.userId());
             return bookingRepository.save(booking);
