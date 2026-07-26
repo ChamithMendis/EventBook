@@ -1,0 +1,99 @@
+● Now the config and service changes. I'm deliberately caching the DTOs, not the JPA entities — caching Event/Seat directly would serialize Hibernate lazy-proxies and hit the Seat 
+  → Event → Seat circular reference. This is also a real caching lesson: keep the cached shape decoupled from your persistence graph. 
+
+TODO — remaining syllabus steps                                                                                                                                                  
+  1. Verify Module 1 yourself — run the app, create an event, book a seat, confirm the double-booking attempt returns 409. - Done                                                          
+  2. Concurrency demo — write a test/script that fires parallel booking requests at the same seat and confirm it oversells (proves the race exists before we fix it). - Done               
+  3. Caching (Redis) — add Spring Data Redis, cache event listing/details with the @Cacheable/@CacheEvict abstraction, then redo it manually with RedisTemplate. - Done                    
+  4. In-JVM locking — fix the race with synchronized, then ReentrantLock, then ReentrantReadWriteLock for the availability-check path.                                              
+  5. DB-level locking — pessimistic lock (@Lock/SELECT FOR UPDATE) vs optimistic locking (@Version); explain why in-JVM locks fail once there's more than one app instance.         
+  6. Distributed locking — Redisson RLock over Redis to solve the multi-instance version of the race.                                                                               
+  7. Async execution — @Async, ThreadPoolTaskExecutor config, CompletableFuture for non-blocking post-booking notifications.                                                        
+  8. Queues — in-memory BlockingQueue producer/consumer first, then a Redis Streams–backed queue with a consumer group for a durable notification worker.                           
+  9. Integration — wire the full flow: distributed lock → DB transaction with locking → cache invalidation → event pushed to queue → async worker consumes it.                      
+  10. (Optional stretch) Redis token-bucket rate limiting on the booking endpoint. 
+
+GET -> http://localhost:8080/api/events
+
+POST -> http://localhost:8080/api/events
+		{
+			"name": "THALA",
+			"venue": "HALLE_1",
+			"eventTime": "2026-07-19",
+			"totalSeats": 1500
+		}
+
+		
+		{
+			"name": "NINNADA",
+			"venue": "HALLE_2",
+			"eventTime": "2026-07-20T19:00:00Z",
+			"totalSeats": 3000
+		}
+		
+GET -> http://localhost:8080/api/events/1
+       http://localhost:8080/api/events/1/seats
+
+psql -h 127.0.0.1 -U eventbook -d eventbook
+password is eventbook
+
+/* Learns */
+You can have multiple bookings when DB locks and constraints (One to One and Foreign Keys) were not handled properly
+FOR UPDATE, NOWAIT, SKIP LOCKED /* https://www.youtube.com/watch?v=D3XhDu--uoI */
+
+Good addition — seat holds are exactly where "shared mutable state without a database transaction" becomes visible, which is a different failure mode than what synchronized/ReentrantLock fixed. Here's the extended plan, building on the locking steps already agreed (1–8):
+
+Part 1 — In-JVM locking (as already laid out)
+
+Steps 1–8 unchanged: per-seat lock registry → synchronized → ReentrantLock (+ tryLock timeout) → ReentrantReadWriteLock on the seat-listing read path → throughput test across different seats → reconcile with existing @Version/@Retryable → flag the multi-seat deadlock risk in bookAdjacentSeats.
+
+Step 1 — Explain the ceiling. In-JVM locks only coordinate threads inside one JVM. The moment you run two instances of this app, each has its own separate lock, and the seat-1 race reopens across instances. Keep this explicit going in, so it's clear why Module 6 (distributed locks) still has to happen later.
+
+Step 2 — Build a per-seat lock registry. We need "the lock for seat X," not one global lock — a single app-wide lock would serialize every booking for every seat, killing throughput for unrelated seats. Concept: a ConcurrentHashMap keyed by seatId, lock objects created lazily/atomically (computeIfAbsent).
+
+Step 3 — Version A: synchronized. Wrap the existing check-then-act block in synchronized on that seat's lock object. Re-run your ParallelApiCaller against seat 1: expect exactly one success, and — new observation — the @Retryable optimistic-lock retry should basically never fire anymore, since only one thread at a time is even reaching the DB for that seat. Then discuss synchronized's limits: no timeout, no tryLock, can't be interrupted, no fairness knob.
+
+Step 4 — Version B: ReentrantLock. Swap the registry to hold ReentrantLock instances, rewrite the critical section as lock() / try / finally unlock(). Then add the feature synchronized can't give you: tryLock(timeout, unit) to fail fast with a 409/423 instead of making a user queue indefinitely behind someone else's in-flight booking of the same seat. Also cover reentrancy and the fairness constructor flag.
+
+Step 5 — Version C: ReentrantReadWriteLock on the availability-check path. Apply it to the seat-listing/availability read (GET .../seats), which is read-heavy vs. the rare booking write. Many concurrent readers proceed together; a writer (booking) still gets exclusive access. Discuss the tradeoff: only worth it when reads are frequent/expensive relative to writes, and the writer-starvation risk.
+
+Step 6 — Validate throughput, not just correctness. Run a second load-test variant: many concurrent users booking different seats (1–5) simultaneously, to prove the per-seat lock isn't accidentally serializing unrelated bookings.
+
+Step 7 — Reconcile with what you already built. Explicitly note: @Version/@Retryable stay — they're your safety net for the multi-instance case the JVM lock can't cover. The JVM lock becomes the fast local path; the DB-level optimistic check becomes defense-in-depth.
+
+Step 8 — Flag, don't fix yet: your bookAdjacentSeats endpoint locks multiple seats per request — locking seats in inconsistent order across concurrent requests is a classic deadlock setup. Worth calling out now as a known gap; fixing it (e.g., always acquire locks in sorted seat-id order) is a good exercise once single-seat locking is solid.
+
+
+Part 2 — Seat Hold feature, Version A: plain HashMap
+
+Step 9 — Define the concept. A hold is a temporary claim on a seat (seatId, holderId, expiresAt) that blocks other bookings without being a real booking yet — the "add to cart" step before checkout. Real systems (Ticketmaster etc.) use this so an abandoned session doesn't lock a seat forever.
+
+Step 10 — Keep it out of Postgres, on purpose. Store holds purely in memory in a new singleton service, not as a DB entity. This isolates the lesson to pure Java concurrency, with no transaction semantics muddying the picture.
+
+Step 11 — Build Version A with a plain HashMap<Long, Hold>. A Spring singleton bean means every request thread shares this one map with zero synchronization — deliberately unsafe.
+
+Step 12 — New endpoint concept: something like "place a hold on seat X for user Y," which checks-then-inserts into the map.
+
+Step 13 — Break it, two ways:
+- Business race: concurrent hold requests on the same seat — expect more than one to succeed (bad).
+- Structural race: hammer the map with concurrent holds/releases across many seats simultaneously, aiming to trigger HashMap's real danger under concurrent mutation — not just a lost update, but internal corruption (lost entries, infinite loop on resize, ConcurrentModificationException). Worth attempting even if it's not 100% reliably reproducible — it's the textbook reason "just use a HashMap" is dangerous, distinct from the seat-booking race we fixed with locks.
+
+Step 14 — Name the failure precisely. This is a step below what we fixed earlier: before, the seat row was the unprotected shared resource; now the map itself is unsafe for concurrent access, independent of any business logic bug.
+
+Part 3 — Seat Hold, Version B: ConcurrentHashMap
+
+Step 15 — Swap in ConcurrentHashMap. Re-run Step 13's tests: structural corruption should be gone — individual get/put/remove are now safe.
+
+Step 16 — Show what it doesn't fix for free. A naive "if absent, then put" written as two separate calls is still racy even on ConcurrentHashMap — the same-seat business race from Step 13 can still reappear if the compound check isn't atomic.
+
+Step 17 — Fix it properly with atomic compound operations. Use putIfAbsent or compute/computeIfAbsent, with expiry-aware logic (an existing-but-expired hold should be treated as absent). This is the actual payoff of ConcurrentHashMap over a hand-rolled lock: atomicity without an external ReentrantLock at all — a deliberate contrast with Steps 3–4, where we used a ConcurrentHashMap only as a lock registry, not as the protected data itself.
+
+Step 18 — Decide expiry strategy for now. Lazy expiry checked inside the same atomic compute call (no extra thread yet). Flag active/scheduled expiry (a sweeper thread, or later a Redis key with a native TTL) as a natural forward-reference to the async/queue modules and back to caching.
+
+Step 19 — Wire hold → booking. Booking a held seat should succeed only for the holder (or if unheld/expired), and on success should clear the hold entry.
+
+Step 20 — Re-run load tests for real: same-seat concurrent holds (expect exactly one winner), many-seat concurrent holds (expect all independent, no cross-seat contention), and a hold that's allowed to expire mid-test (seat becomes holdable again, stale booking attempt rejected).
+
+Step 21 — Compare and reflect. HashMap vs ConcurrentHashMap vs explicit ReentrantLock: when a single map entry is the entire critical section, ConcurrentHashMap's atomic methods are usually the cleaner fit; explicit locks earn their keep when the critical section spans multiple resources (like our seat row + booking row together).
+
+Let me know if you want to reorder, or if the hold duration / endpoint shape should be decided before we start building.
